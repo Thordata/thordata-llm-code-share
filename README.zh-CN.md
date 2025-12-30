@@ -1,187 +1,147 @@
 # thordata-llm-code-share
+一个小而实用的工具：把本地仓库变成 **只读、适合大模型读取的文本接口**。
 
-把本地代码仓库暴露为 **大模型友好的只读文本接口**（本地安全模式 / 可选 Cloudflare Quick Tunnel 公网分享）。
+支持两种读取模式：
+- **全量通读模式**：`/all`（秒回索引）→ `/all?part=N`（分片 bundle）
+- **精准读取模式**：`/tree` → `/file?path=...`（按需读文件）
 
-这个工具的目标是把“给大模型喂代码”变成一个稳定、可复用的流程：
+默认本机安全（仅 127.0.0.1）。可选 Cloudflare Quick Tunnel 一键生成公网链接分享给远程模型。
 
-1. 启动本地只读文本服务（带过滤规则）
-2. 可选：构建缓存，把仓库切成多个 chunk（减少超时/提升读取稳定性）
-3. 可选：启动 Cloudflare Quick Tunnel，拿到公网 URL 分享给远程大模型
-4. 直接复制工具输出的提示词模板，让模型按 `/all` → `/all?part=N` 或 `/tree` + `/file` 读取
-
----
-
-## 包含哪些文件
-
-- `llm_server.py`：把仓库暴露成只读文本接口的 HTTP Server
-- `start_quick_tunnel.py`：一键启动 Server + `cloudflared`（Quick Tunnel），打印可分享链接与提示词模板
 
 ---
 
-## 核心特性
-
-### 全量通读（给大模型一次性扫仓库）
-- `/build` 把仓库打包成多个 chunk 写入缓存目录（默认 `.llm_cache/`）
-- `/all` 返回 **秒回索引**（FAST index）
-- `/all?part=N` 返回指定 chunk（从缓存文件快速流式输出）
-
-### 精准读取（更推荐，仓库大时更省 token）
-- `/tree` 输出过滤后的文件清单 + 大小
-- `/file?path=...` 精准读取单文件（纯文本 + 头信息）
-
-### 默认更安全
-- 默认只绑定 `127.0.0.1`（只允许本机访问）
-- 不开放目录浏览，只开放明确的几个接口
-- 默认屏蔽常见敏感文件/二进制后缀（如 `.env/.pem/.key` 等）
-- 默认忽略依赖/构建输出目录（如 `node_modules/dist/target/vendor/...`）
-- 二进制探测：包含 `\x00` 直接跳过
-- 单文件过大自动截断，避免撑爆 chunk/导致超时
+## 问题是什么
+大模型想“读懂仓库”经常会被现实限制卡住：
+- 仓库太大，塞不进聊天上下文
+- 手动复制粘贴慢、容易漏文件
+- 大模型 URL 抓取经常遇到超时/中断
+- 你希望模型读取的是你本机当前代码（而不是你粘贴的一小段）
 
 ---
 
-## 环境要求
+## 解决方案与工作原理
+这个工具提供一个极简 HTTP Server，把仓库作为纯文本输出：
 
-- Python 3（建议 3.9+）
-- 可选：`cloudflared`（只在你需要公网分享链接时才需要）
+### 模式 1：全量通读（分片 bundle）
+1）`GET /build` 扫描仓库，生成分片缓存写入 `.llm_cache/`  
+2）`GET /all` 返回很小的索引（秒回）  
+3）`GET /all?part=N` 返回第 N 片纯文本（从磁盘流式输出）
 
----
+为什么要分片：
+- 很多大模型“读 URL”的抓取器有严格超时
+- 分片能显著降低“单个超大响应失败”的概率
 
-## 快速开始：仅本地使用
+### 模式 2：精准读取（更可控）
+- `GET /tree` 输出过滤后的文件清单
+- `GET /file?path=...` 精准读取单文件
 
-在 **thordata-llm-code-share** 仓库目录下执行：
-
-```bash
-python llm_server.py --root "/path/to/your/repo" --warmup
-```
-
-常用地址：
-
-- `http://127.0.0.1:8080/health`
-- `http://127.0.0.1:8080/all`（索引）
-- `http://127.0.0.1:8080/all?part=1`（第 1 片）
-- `http://127.0.0.1:8080/tree`（文件列表）
-- `http://127.0.0.1:8080/file?path=README.md`（读单文件）
+仓库越大，精准模式越省 token、越不容易“读一堆无关文件”。
 
 ---
 
-## 快速开始：公网分享（Cloudflare Quick Tunnel）
+## 适用场景
+### 特别适合
+- “请通读仓库并总结架构/模块边界”
+- “这个 bug 需要跨多个文件定位”
+- “做一次 code review（性能/安全/可维护性）”
+- “生成文档/接口说明/迁移指南”
+- “让 Agent 用 URL 拉文件，而不是让人粘贴”
 
-> 这个命令会同时启动 `llm_server.py` 和 `cloudflared`，然后在终端打印公网 URL、分片链接、以及可直接复制给大模型的提示词模板。
+### 不适合
+- 不要把 Quick Tunnel 当作生产级服务（它是临时分享用的）
+- 不要在不确认过滤规则的情况下把公网链接发给不可信对象
+
+---
+
+## 快速开始
+
+### 方式 A：公网分享（Cloudflare Quick Tunnel）
+1）安装 `cloudflared` 并确保 PATH 可用  
+2）运行：
 
 ```bash
 python start_quick_tunnel.py --root "/path/to/your/repo" --chunk-bytes 600000 --auto-port
 ```
 
-你会得到：
-- 公网域名：`https://xxxx.trycloudflare.com`
-- `/all`、`/tree`、`/all?part=1..N`、`/file?path=...`
-- 两套提示词模板（全量通读 / 精准读文件）
+脚本会打印：
+- 公网域名 `https://xxxx.trycloudflare.com`
+- `/all`（从这里开始）、`/tree`、`/all?part=1..N`、`/file?path=...`
+- 两套提示词模板（全量通读 + 精准读文件）
 
-### 网络需要 HTTP 代理时（例如 Clash）
+如果网络需要代理：
 ```bash
-python start_quick_tunnel.py \
-  --root "/path/to/your/repo" \
-  --chunk-bytes 600000 \
-  --auto-port \
-  --proxy "http://127.0.0.1:7897"
+python start_quick_tunnel.py --root "/path/to/your/repo" --chunk-bytes 600000 --auto-port --proxy "http://127.0.0.1:7897"
 ```
 
-该参数会把代理环境变量传给 `cloudflared`。
+### 方式 B：仅本地
+```bash
+python llm_server.py --root "/path/to/your/repo" --warmup
+```
 
 ---
 
 ## 接口说明
-
-### `GET /`
-返回简短帮助信息。
-
-### `GET /health`
-健康检查，返回 `ok`。
-
-### `GET /robots.txt`
-返回 `Disallow: /`，减少爬虫/探测器噪音。
-
-### `GET /tree`
-返回 TSV（制表符分隔）：
-
-- `相对路径<TAB>文件大小字节数`
-
-输出会经过过滤规则。
-
-### `GET /file?path=relative/path/to/file.py`
-读取单文件（纯文本 + 文件头）。会做安全校验：
-- path 不能逃逸出 `--root`
-- 命中敏感/二进制/忽略规则会直接拒绝
-- 跳过 symlink
-
-### `GET /build[?refresh=1]`
-构建缓存分片（重任务）。返回 `meta.json`（JSON）。
-
-### `GET /meta`
-读取缓存 `meta.json`（必须先有缓存）。
-
-### `GET /all`
-如果已有缓存：返回 `index.txt`（秒回）。
-如果没有缓存：提示先运行 `/build`。
-
-### `GET /all?part=N`
-返回第 N 片 bundle 内容（从缓存文件快速输出）。
+- `GET /`：简短帮助
+- `GET /health`：健康检查，返回 `ok`
+- `GET /robots.txt`：返回 `Disallow: /`（减少探测噪音）
+- `GET /tree`：过滤后的文件清单（TSV：相对路径 + 大小）
+- `GET /file?path=...`：读取单文件（会做防逃逸/过滤/二进制检测）
+- `GET /build[?refresh=1]`：构建分片缓存并返回 meta
+- `GET /meta`：读取 meta（需先 build）
+- `GET /all`：读取索引（秒回）
+- `GET /all?part=N`：读取第 N 片 bundle
 
 ---
 
-## 参数说明（CLI）
+## 调参指南（超时 vs 分片数）
+关键参数：
+- `--chunk-bytes`：分片大小
+- `--max-single-file-bytes`：单文件超大时截断
 
-### `llm_server.py`
-常用参数：
+推荐：
+- `600000`：更稳（更不容易超时），但分片更多
+- `900000`：折中
+- `1200000`：分片更少，但部分抓取器更容易超时
 
-- `--root`：仓库根目录（默认 cwd）
-- `--bind`：监听地址（默认 `127.0.0.1`）
-- `--port`：端口（默认 `8080`）
-- `--warmup`：启动时先 build 一次（推荐）
-- `--auto-build`：首次访问 `/all` 时若无缓存就自动 build
-- `--chunk-bytes`：chunk 大小（建议 60 万 ~ 120 万）
-- `--max-single-file-bytes`：单文件最大读取字节数，超出截断（默认 300 万）
-- `--cache-dirname`：缓存目录名（默认 `.llm_cache`）
-- `--no-lock-ignore`：不忽略 `*.lock` 文件
-- `--exclude-github`：忽略 `.github`
-
-### `start_quick_tunnel.py`
-常用参数：
-
-- `--root`：仓库根目录（必填）
-- `--auto-port`：端口被占用时自动找下一个可用端口
-- `--chunk-bytes`：推荐 `600000`（更稳）
-- `--protocol`：`http2` 或 `quic`（默认 `http2`）
-- `--proxy`：cloudflared 使用的代理（如 `http://127.0.0.1:7897`）
-- `--open`：自动用浏览器打开公网 `/all`
-- `--no-warmup`：跳过 warmup build（不推荐）
-- `--auto-build`：server 侧缺缓存时自动 build
+如果模型经常拉取失败：
+- 调小 `--chunk-bytes`
+- 排除噪音文件（如 lockfiles、生成物、大 JSON 等）
 
 ---
 
-## 推荐给大模型的阅读方式
+## 安全策略
+默认更安全的行为：
+- 默认仅监听 `127.0.0.1`
+- 不开放目录浏览（只开放固定接口）
+- 屏蔽常见敏感文件名/后缀（`.env/.pem/.key` 等）
+- 忽略常见依赖/构建目录
+- 跳过 symlink 和二进制文件（含 0x00）
+- 大文件截断降低风险
 
-### 方式 A：全量通读（最省事）
-1. 先读 `/all`（索引）
-2. 再按顺序读 `/all?part=1..N`
-3. 引用代码时使用 bundle 里的 `FILE: ...` 路径
-
-### 方式 B：精准读取（仓库大时更省 token）
-1. 先读 `/tree`
-2. 按需用 `/file?path=...` 精准读取
-3. 需要大范围上下文时再补 `/all`
+注意：这是“降低风险”，不是“绝对保证”。公网分享前请自行评估过滤规则覆盖范围。
 
 ---
 
-## 常见问题
+## 限制与边界
+- Quick Tunnel 不保证在线；必须保持脚本运行，且 URL 每次可能变化。
+- 忽略规则是启发式的；不同公司/项目需要按需调整。
+- 大模型抓取器各不相同：有的超时严格、有的缓存强、有的并发策略不同。
+
+---
+
+## 常见问题排查
 
 ### 公网链接出现 Cloudflare 1033
-通常是 `cloudflared` 不健康或已退出。请确保启动脚本所在终端持续运行，并观察 cloudflared 日志是否还在输出。
+通常是 cloudflared 不健康或已退出。保持启动脚本所在终端运行，并观察 cloudflared 日志。
 
-### 大模型读取慢/超时、分片太多
-调整 `--chunk-bytes`：
-- `600000`：更稳，但分片更多
-- `1200000`：分片更少，但某些 fetcher 更容易超时
+### 本地 OK，但公网 /health 超时
+可尝试：
+- 在受限网络里使用 `--proxy`
+- 切换 `--protocol http2` / `--protocol quic`
+- 调小 `--chunk-bytes`
+
+### 分片太多
+适当增大 `--chunk-bytes`，或排除噪音目录/文件。
 
 ---
 

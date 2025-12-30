@@ -1,193 +1,166 @@
 # thordata-llm-code-share
+A small, practical tool that turns a local repository into **read-only, LLM-friendly text endpoints**.
 
-Expose a local code repository as **LLM-friendly, read-only text endpoints** — either locally (safe by default) or through a **Cloudflare Quick Tunnel** for sharing with remote LLMs.
+It supports two reading modes:
+- **Full snapshot mode:** `/all` (FAST index) → `/all?part=N` (chunked bundles)
+- **Precise mode:** `/tree` → `/file?path=...` (fetch only what’s needed)
 
-This tool is designed for a practical workflow:
+Default is safe (localhost-only). Optional Cloudflare Quick Tunnel makes it shareable with remote LLMs.
 
-1. Start a local server that can list files and serve files as plain text (with safety filters).
-2. Optionally build a cached, chunked “bundle” so LLM fetchers can read the whole repo reliably.
-3. (Optional) Start a Cloudflare Quick Tunnel and share a public URL with your LLM.
-4. Give the LLM a prompt template so it reads `/all` (index) → `/all?part=N` (chunks), or uses `/tree` + `/file` for precise reads.
-
----
-
-## What’s included
-
-- `llm_server.py`: read-only HTTP server exposing the repo as text endpoints
-- `start_quick_tunnel.py`: launcher that starts the server + `cloudflared` Quick Tunnel and prints shareable URLs and prompt templates
 
 ---
 
-## Key features
-
-### LLM-friendly “whole repo” reading
-- `/build` generates chunked bundle files into a cache directory (default: `.llm_cache/`)
-- `/all` returns a **FAST index** (seconds)
-- `/all?part=N` returns a specific chunk (fast file streaming)
-
-### Precise file reading (recommended for large repos)
-- `/tree` returns a filtered file list with sizes
-- `/file?path=...` returns a single file (plain text) with a header
-
-### Safe-by-default
-- Default bind: `127.0.0.1` (localhost only)
-- No directory listing; only the endpoints below
-- Blocks common secrets and binary formats (`.env`, `.pem`, `.key`, etc.)
-- Skips dependency/build output folders (`node_modules`, `dist`, `target`, `vendor`, etc.)
-- Skips binary-looking files (null bytes)
-- Truncates very large single files to avoid huge chunks
+## Problem
+Modern LLMs often cannot “see” your repo reliably:
+- repos are too large for chat context windows
+- manual copy-paste is slow and error-prone
+- LLM URL fetchers can time out on large payloads
+- you want the model to read the repo exactly as-is (not a partial paste)
 
 ---
 
-## Requirements
+## Solution (how it works)
+This tool provides a tiny HTTP server that exposes your repo as plain text:
 
-- Python 3 (recommended: 3.9+)
-- Optional: `cloudflared` (only needed if you want a public share link)
+### Mode 1 — Full snapshot (LLM-friendly bundles)
+1) `GET /build` scans the repo and writes cached bundle files into `.llm_cache/`
+2) `GET /all` returns a tiny index instantly (FAST)
+3) `GET /all?part=N` returns chunk `N` as plain text, streamed from disk
 
----
+Why chunking helps:
+- Many LLM “URL reader” tools have strict timeouts.
+- Smaller chunks reduce the risk of a single large response failing.
 
-## Quick start (local only)
+### Mode 2 — Precise reads
+- `GET /tree` returns a filtered list of files.
+- `GET /file?path=...` returns a single file as text.
 
-From the repo root of **thordata-llm-code-share**:
-
-```bash
-python llm_server.py --root "/path/to/your/repo" --warmup
-```
-
-Then open:
-
-- `http://127.0.0.1:8080/health`
-- `http://127.0.0.1:8080/all` (index)
-- `http://127.0.0.1:8080/all?part=1` (chunk 1)
-- `http://127.0.0.1:8080/tree` (file list)
-- `http://127.0.0.1:8080/file?path=README.md` (single file)
+This scales best for large repos: the model reads only relevant files.
 
 ---
 
-## Quick start (public share via Cloudflare Quick Tunnel)
+## When to use
+### Great fits
+- “Read my repo and explain the architecture.”
+- “Find the bug across multiple modules.”
+- “Review my codebase for security/performance issues.”
+- “Generate docs, API reference, or migration notes.”
+- “Let an agent fetch files by URL instead of pasting.”
 
-> This starts both `llm_server.py` and `cloudflared`, then prints public URLs + prompt templates.
+### Not a good fit
+- Don’t use Quick Tunnel for production-grade hosting. It is for temporary sharing.
+- Don’t share public URLs if your repo may contain secrets not covered by ignore rules.
+
+---
+
+## Quick start
+
+### Option A — Public sharing via Cloudflare Quick Tunnel
+1) Install `cloudflared` and ensure it’s in PATH.
+2) Run:
 
 ```bash
 python start_quick_tunnel.py --root "/path/to/your/repo" --chunk-bytes 600000 --auto-port
 ```
 
-What you’ll get in the terminal:
-- Public base URL: `https://xxxx.trycloudflare.com`
-- `.../all`, `.../tree`, `.../all?part=1..N`
-- Prompt templates (Full snapshot + Precise files)
+The launcher prints:
+- public base URL `https://xxxx.trycloudflare.com`
+- `/all` (start here), `/tree`, `/all?part=1..N`, example `/file?path=...`
+- two prompt templates: Full snapshot + Precise files
 
-### If your network requires an HTTP proxy (example: Clash)
+If you need a proxy:
 ```bash
-python start_quick_tunnel.py \
-  --root "/path/to/your/repo" \
-  --chunk-bytes 600000 \
-  --auto-port \
-  --proxy "http://127.0.0.1:7897"
+python start_quick_tunnel.py --root "/path/to/your/repo" --chunk-bytes 600000 --auto-port --proxy "http://127.0.0.1:7897"
 ```
 
-This passes proxy env vars to `cloudflared`.
+### Option B — Local only
+```bash
+python llm_server.py --root "/path/to/your/repo" --warmup
+```
 
 ---
 
 ## Endpoints
+- `GET /`  
+  Short help text.
 
-### `GET /`
-Shows a short help text.
+- `GET /health`  
+  Health check: returns `ok`.
 
-### `GET /health`
-Returns `ok` if server is alive.
+- `GET /robots.txt`  
+  `Disallow: /` to reduce crawler noise.
 
-### `GET /robots.txt`
-Returns `Disallow: /` to reduce crawler noise.
+- `GET /tree`  
+  Filtered file list in TSV: `rel_path<TAB>size_bytes`.
 
-### `GET /tree`
-Returns a tab-separated file list:
+- `GET /file?path=...`  
+  Single file as text. Enforces:
+  - no path escape beyond repo root
+  - blocked by ignore rules / binary detection
 
-- `rel_path<TAB>size_bytes`
+- `GET /build[?refresh=1]`  
+  Build cached bundles and return meta JSON.
 
-Files are filtered by ignore rules.
+- `GET /meta`  
+  Return cached meta JSON (requires prior build).
 
-### `GET /file?path=relative/path/to/file.py`
-Returns a single file as text (with a header). Security checks:
-- must stay under `--root`
-- blocked if secret/binary/ignored
-- symlinks skipped
+- `GET /all`  
+  Return FAST index from cache (or hints to build).
 
-### `GET /build[?refresh=1]`
-Builds `.llm_cache/` bundles and returns `meta.json` as JSON.
-
-### `GET /meta`
-Returns the cached `meta.json` (requires cache to exist).
-
-### `GET /all`
-If cache exists: returns `index.txt` (FAST).
-If not: suggests running `/build`.
-
-### `GET /all?part=N`
-Returns bundle `N` (fast streaming from cached bundle files).
+- `GET /all?part=N`  
+  Return chunk N (streamed).
 
 ---
 
-## CLI usage
+## Tuning guide (timeouts vs parts)
+### Key flags
+- `--chunk-bytes` (bundle chunk size)
+- `--max-single-file-bytes` (truncate large single files)
 
-### `llm_server.py`
-Common flags:
+### Recommended values
+- `600000` (600 KB): more stable, more parts
+- `900000` (900 KB): balanced default
+- `1200000` (1.2 MB): fewer parts, higher timeout risk for some LLM fetchers
 
-- `--root`: repo root (default: current directory)
-- `--bind`: bind address (default: `127.0.0.1`)
-- `--port`: port (default: `8080`)
-- `--warmup`: build cache at startup (recommended)
-- `--auto-build`: auto-build cache on first `/all` if missing
-- `--chunk-bytes`: chunk size in bytes (recommended: 600k–1.2MB)
-- `--max-single-file-bytes`: truncate large files (default: 3MB)
-- `--cache-dirname`: cache folder name under root (default: `.llm_cache`)
-- `--no-lock-ignore`: include `*.lock` files (off by default)
-- `--exclude-github`: exclude `.github` directory
-
-### `start_quick_tunnel.py`
-Common flags:
-
-- `--root`: repo root (required)
-- `--auto-port`: if port is busy, pick next free port
-- `--chunk-bytes`: recommend `600000` for stability
-- `--protocol`: `http2` or `quic` (default: `http2`)
-- `--proxy`: optional proxy for cloudflared (`http://127.0.0.1:7897`)
-- `--open`: open the public `/all` in your browser
-- `--no-warmup`: skip warmup build (not recommended)
-- `--auto-build`: server auto-builds on first `/all` if missing
+If an LLM frequently fails to fetch parts:
+- reduce `--chunk-bytes`
+- consider excluding large/noisy files (lockfiles, generated files, big JSON)
 
 ---
 
-## Recommended LLM reading workflow
+## Security model
+Safe-by-default behavior:
+- binds to `127.0.0.1`
+- no directory listing / no raw file serving
+- blocks common secret filenames and extensions (`.env`, `.pem`, `.key`, etc.)
+- ignores common dependency/build directories
+- skips symlinks and binary-looking files (null bytes)
 
-### Option A — Full snapshot (simple)
-1. Read `.../all` (index)
-2. Read `.../all?part=1..N` in order
-3. Ask questions and cite paths shown as `FILE: ...`
+Important: this is **risk reduction**, not a guarantee. Always assume public URLs expose what passes the filters.
 
-### Option B — Precise files (scales better)
-1. Read `.../tree`
-2. Fetch only what you need via `.../file?path=...`
-3. Use `/all` only if you need broad context
+---
+
+## Limitations
+- Quick Tunnels have no uptime guarantees and may disconnect; keep the launcher running.
+- The public hostname changes each run (Quick Tunnel behavior).
+- Ignore rules are heuristic; review them for your org’s needs.
+- LLM fetchers vary: some cache aggressively, some have strict timeouts.
 
 ---
 
 ## Troubleshooting
 
-### Public URL shows Cloudflare “1033”
-This usually means `cloudflared` is not healthy or exited. Keep the launcher terminal running and ensure `cloudflared` logs are still updating.
+### Cloudflare error 1033 on public URL
+Usually means `cloudflared` is not healthy or has exited. Keep the launcher terminal open and check cloudflared logs.
 
-### Server is OK locally but public `/health` is not reachable
+### Works locally but public /health times out
 Try:
-- rerun with `--proxy` if your network requires it
-- switch `--protocol http2` vs `--protocol quic` depending on network restrictions
-- ensure firewalls do not block outbound connections for `cloudflared`
+- `--proxy` if your network requires it
+- switch protocol (`--protocol http2` vs `--protocol quic`)
+- reduce `--chunk-bytes` to avoid large responses
 
-### Many parts / slow LLM fetch
-Tune `--chunk-bytes`:
-- smaller chunks (e.g., 600000): more stable, more parts
-- larger chunks (e.g., 1200000): fewer parts, may time out for some fetchers
+### Too many parts / index says dozens of bundles
+Increase `--chunk-bytes` slightly, or exclude noisy folders/files.
 
 ---
 
