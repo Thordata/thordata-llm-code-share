@@ -41,7 +41,7 @@ DEFAULT_BIND = "127.0.0.1"
 DEFAULT_CACHE_DIRNAME = ".llm_cache"
 
 # 建议 chunk 0.6MB~1.2MB：太大容易被抓取器/链路超时；太小 part 太多
-DEFAULT_CHUNK_BYTES = 900_000
+DEFAULT_CHUNK_BYTES = 600_000
 
 # 单文件太大（比如巨型 JSON/YAML/spec），直接截断，避免撑爆 chunk/耗时
 DEFAULT_MAX_SINGLE_FILE_BYTES = 3_000_000
@@ -106,6 +106,9 @@ IGNORE_FILES_EXACT = {
 
     # metadata
     "SOURCES.txt", "PKG-INFO",
+
+    ".git",          # submodule often has .git as a FILE
+    ".gitmodules",   # optional: reduce noise
 }
 
 # 常见敏感/二进制后缀：直接不让读
@@ -599,7 +602,13 @@ def main():
     ap.add_argument("--no-lock-ignore", action="store_true", help="do not ignore *.lock files")
     ap.add_argument("--warmup", action="store_true", help="build cache at startup (recommended)")
     ap.add_argument("--auto-build", action="store_true", help="auto build on first /all if missing")
+    ap.add_argument("--exclude-github", action="store_true", help="exclude .github directory")
     args = ap.parse_args()
+
+    if args.exclude_github:
+        IGNORE_DIRS_EXACT.add(".github")
+
+    IGNORE_DIRS_EXACT.add(args.cache_dirname)
 
     root_dir = os.path.abspath(args.root)
     cache_dir = os.path.join(root_dir, args.cache_dirname)
@@ -627,8 +636,8 @@ def main():
         auto_build=args.auto_build,
     )
 
-    print(f"✅ ROOT: {root_dir}")
-    print(f"✅ LOCAL: http://{args.bind}:{args.port}")
+    print(f"[OK] ROOT: {root_dir}")
+    print(f"[OK] LOCAL: http://{args.bind}:{args.port}")
     print("Endpoints: /build /all /all?part=N /tree /file?path=... /meta /health")
     print("Safety: blocks .env/.pem/.key + ignores node_modules/target/vendor/dist/... by default.")
     httpd.serve_forever()
