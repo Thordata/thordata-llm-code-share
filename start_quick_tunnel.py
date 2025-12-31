@@ -16,7 +16,26 @@ from pathlib import Path
 from queue import Queue, Empty
 import threading
 
-TRY_URL_RE = re.compile(r"(https://[a-z0-9-]+\.trycloudflare\.com)", re.I)
+# Match any trycloudflare host, but we will filter it.
+TRY_HOST_RE = re.compile(r"https://([a-z0-9-]+)\.trycloudflare\.com\b", re.I)
+
+# Detect quick-tunnel request failures early
+QUICK_TUNNEL_FAIL_RE = re.compile(r"failed to request quick tunnel", re.I)
+
+# Common cloudflared network-ish errors (optional; used only for better messages)
+NET_ERR_RE = re.compile(r"(context deadline exceeded|timeout|TLS handshake|connection refused)", re.I)
+
+
+def safe_console_write(prefix: str, line: str) -> None:
+    """Never crash due to console encoding issues."""
+    try:
+        sys.stdout.write(prefix + line)
+        sys.stdout.flush()
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+        b = (prefix + line).encode(enc, errors="replace")
+        sys.stdout.buffer.write(b)
+        sys.stdout.flush()
 
 
 def http_get(url: str, timeout: float = 5.0, proxy: str = "") -> str:
@@ -27,7 +46,7 @@ def http_get(url: str, timeout: float = 5.0, proxy: str = "") -> str:
             urllib.request.ProxyHandler({"http": proxy, "https": proxy})
         )
     else:
-        # 关键：禁用系统代理（避免 Clash/系统代理影响健康检查）
+        # Disable system proxy by default (avoid Clash/system-proxy interference)
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     with opener.open(req, timeout=timeout) as resp:
@@ -71,7 +90,6 @@ def format_prompt_full(public_url: str, bundle_count: int | None) -> tuple[str, 
     if bundle_count and bundle_count > 0:
         parts = [f"{public_url}/all?part={i}" for i in range(1, bundle_count + 1)]
 
-    # English
     en = []
     en.append("You are given a code repository snapshot exposed via a read-only text server.")
     en.append("Please read the repository and then answer my questions.")
@@ -91,14 +109,13 @@ def format_prompt_full(public_url: str, bundle_count: int | None) -> tuple[str, 
     else:
         en.append("- Parts: (open the index to see the list)")
 
-    # Chinese
     zh = []
     zh.append("下面是一个只读的“代码文本服务”，里面包含仓库的快照。请先通读再回答我的问题。")
     zh.append("")
     zh.append("阅读规则：")
-    zh.append("1)先读索引 /all,它会告诉你一共有几片 part。")
-    zh.append("2)再按顺序读取 part=1..N(或读到足够为止)。")
-    zh.append("3)引用代码时请带上文件路径(bundle 里有 FILE: ...）。")
+    zh.append("1）先读索引 /all，它会告诉你一共有几片 part。")
+    zh.append("2）再按顺序读取 part=1..N（或读到足够为止）。")
+    zh.append("3）引用代码时请带上文件路径（bundle 里有 FILE: ...）。")
     zh.append("")
     zh.append("链接：")
     zh.append(f"- 索引: {index}")
@@ -116,7 +133,6 @@ def format_prompt_full(public_url: str, bundle_count: int | None) -> tuple[str, 
 def format_prompt_precise(public_url: str) -> tuple[str, str]:
     tree = f"{public_url}/tree"
 
-    # English
     en = []
     en.append("You are given a code repository snapshot exposed via a read-only text server.")
     en.append("Please answer my questions by reading only the necessary files.")
@@ -131,15 +147,14 @@ def format_prompt_precise(public_url: str) -> tuple[str, str]:
     en.append(f"- Tree: {tree}")
     en.append(f"- File: {public_url}/file?path=relative/path/to/file.py")
 
-    # Chinese
     zh = []
     zh.append("下面是一个只读的“代码文本服务”。请尽量只读取必要文件，再回答我的问题。")
     zh.append("")
     zh.append("阅读规则：")
-    zh.append("1)先读 /tree 获取文件清单。")
-    zh.append("2)再用 /file?path=... 按需读取具体文件内容。")
-    zh.append("3)如果需要更广的上下文，再补充读取 /all 和 /all?part=N。")
-    zh.append("4)引用代码时请带上文件路径（响应中有 FILE: ...）。")
+    zh.append("1）先读 /tree 获取文件清单。")
+    zh.append("2）再用 /file?path=... 按需读取具体文件内容。")
+    zh.append("3）如果需要更广的上下文，再补充读取 /all 和 /all?part=N。")
+    zh.append("4）引用代码时请带上文件路径（响应中有 FILE: ...）。")
     zh.append("")
     zh.append("链接：")
     zh.append(f"- 文件树: {tree}")
@@ -148,35 +163,56 @@ def format_prompt_precise(public_url: str) -> tuple[str, str]:
     return "\n".join(en), "\n".join(zh)
 
 
+def is_valid_quick_tunnel_host(host: str) -> bool:
+    """
+    Cloudflare quick tunnel hostname typically looks like:
+      https://word-word-word-word.trycloudflare.com
+    We explicitly reject api.trycloudflare.com and other non-random patterns.
+    """
+    h = host.lower().strip()
+    if h in {"api"}:
+        return False
+    # Quick tunnel hosts almost always contain '-' (random phrase)
+    if "-" not in h:
+        return False
+    return True
+
+
 def pump_process_output(
     *,
     proc: subprocess.Popen,
     name: str,
     url_queue: Queue | None = None,
+    err_queue: Queue | None = None,
     keep_last: deque | None = None,
 ) -> None:
     """
     Continuously read proc.stdout to avoid blocking child process.
     Optionally parse trycloudflare URL and push to url_queue.
+    Optionally detect 'failed to request quick tunnel' and push to err_queue.
     """
     try:
         assert proc.stdout is not None
         for line in iter(proc.stdout.readline, ""):
             if not line:
                 break
-            sys.stdout.write(line)
-            sys.stdout.flush()
+
+            safe_console_write("", line)
 
             if keep_last is not None:
                 keep_last.append(line.rstrip("\n"))
 
+            if err_queue is not None and QUICK_TUNNEL_FAIL_RE.search(line):
+                err_queue.put(line.strip())
+
             if url_queue is not None:
-                m = TRY_URL_RE.search(line)
+                m = TRY_HOST_RE.search(line)
                 if m:
-                    url_queue.put(m.group(1))
+                    host = m.group(1)
+                    if is_valid_quick_tunnel_host(host):
+                        url_queue.put(f"https://{host}.trycloudflare.com")
     except Exception as e:
-        sys.stdout.write(f"[WARN] output pump for {name} stopped: {e}\n")
-        sys.stdout.flush()
+        safe_console_write("", f"[WARN] output pump for {name} stopped: {e}\n")
 
 
 def main():
@@ -198,7 +234,12 @@ def main():
     ap.add_argument("--server-script", default=None, help="path to llm_server.py (default: same dir as this script)")
 
     ap.add_argument("--open", action="store_true", help="open public /all in your default browser")
-    ap.add_argument("--wait-public-seconds", type=float, default=60.0, help="wait for public /health to become OK")
+
+    # Your requested changes:
+    ap.add_argument("--wait-public-seconds", type=float, default=30.0, help="wait for public /health to become OK (default: 30s)")
+    ap.add_argument("--public-check", default="warn", choices=["warn", "strict", "off"],
+                    help="public /health check behavior: warn (default), strict (exit if fail), off (skip check)")
+
     args = ap.parse_args()
 
     root = os.path.abspath(args.root)
@@ -290,16 +331,6 @@ def main():
             pass
         sys.exit(3)
 
-    # If no warmup, build now (heavy)
-    if args.no_warmup:
-        print("[2/4] Building cache via /build ...")
-        try:
-            meta_txt = http_get(local_base + "/build", timeout=120.0)
-            _ = json.loads(meta_txt)
-        except Exception as e:
-            print("[WARN] /build failed:", e)
-            print("You can still continue, but /all may say 'No cache yet'.")
-
     # 2) start cloudflared and parse public url
     print("[3/4] Starting cloudflared quick tunnel:")
     cf_cmd = [
@@ -312,7 +343,6 @@ def main():
 
     cf_env = os.environ.copy()
     if args.proxy:
-        # Set both lower/upper for compatibility
         cf_env["http_proxy"] = args.proxy
         cf_env["https_proxy"] = args.proxy
         cf_env["HTTP_PROXY"] = args.proxy
@@ -339,23 +369,43 @@ def main():
         sys.exit(4)
 
     url_queue: Queue[str] = Queue()
+    err_queue: Queue[str] = Queue()
     cf_keep_last = deque(maxlen=400)
 
     cf_pump_t = threading.Thread(
         target=pump_process_output,
-        kwargs={"proc": cf_proc, "name": "cloudflared", "url_queue": url_queue, "keep_last": cf_keep_last},
+        kwargs={"proc": cf_proc, "name": "cloudflared", "url_queue": url_queue, "err_queue": err_queue, "keep_last": cf_keep_last},
         daemon=True,
     )
     cf_pump_t.start()
 
     public_url = None
-    try:
-        public_url = url_queue.get(timeout=40)
-    except Empty:
-        public_url = None
+    fail_line = None
 
-    if not public_url:
-        print("[FATAL] Could not parse trycloudflare URL from cloudflared output within timeout.")
+    # Wait for either: URL, failure line, or process exit
+    t0 = time.time()
+    while time.time() - t0 < 60:
+        if cf_proc.poll() is not None:
+            break
+        try:
+            fail_line = err_queue.get_nowait()
+            break
+        except Empty:
+            pass
+        try:
+            public_url = url_queue.get_nowait()
+            break
+        except Empty:
+            pass
+        time.sleep(0.05)
+
+    if fail_line:
+        print("[FATAL] cloudflared failed to request quick tunnel:")
+        print(" ", fail_line)
+        if NET_ERR_RE.search(fail_line):
+            print("Hint: looks like network/proxy/TLS issues reaching api.trycloudflare.com.")
+            if not args.proxy:
+                print("Try re-run with: --proxy \"http://127.0.0.1:7897\" (if you use Clash).")
         print("---- cloudflared output (last lines) ----")
         for line in list(cf_keep_last)[-120:]:
             print(line)
@@ -369,12 +419,8 @@ def main():
             pass
         sys.exit(5)
 
-    # 2.5) Wait until public URL really works
-    pub_health = public_url + "/health"
-    print(f"[3.5/4] Waiting for public health OK: {pub_health}")
-    if not wait_http_ok(pub_health, timeout_sec=float(args.wait_public_seconds), interval=0.5, proxy=(args.proxy or "")):
-        print("[FATAL] Public /health did not become reachable within timeout.")
-        print("This usually means the tunnel is not healthy (may lead to Cloudflare 1033).")
+    if not public_url:
+        print("[FATAL] Could not obtain trycloudflare public URL from cloudflared output.")
         print("---- cloudflared output (last lines) ----")
         for line in list(cf_keep_last)[-160:]:
             print(line)
@@ -386,18 +432,45 @@ def main():
             server_proc.terminate()
         except Exception:
             pass
-        sys.exit(6)
+        sys.exit(5)
+
+    # 2.5) Optional: Wait until public URL works (configurable)
+    pub_health = public_url + "/health"
+    print(f"[3.5/4] Waiting for public health OK: {pub_health}")
+    ok = True
+    if args.public_check != "off":
+        ok = wait_http_ok(pub_health, timeout_sec=float(args.wait_public_seconds), interval=0.5, proxy=(args.proxy or ""))
+
+    if not ok:
+        msg = (
+            f"[WARN] Public /health not reachable within {args.wait_public_seconds}s.\n"
+            f"public-check={args.public_check}. You may still try sharing the URL; quick tunnels can be slow to propagate.\n"
+        )
+        print(msg)
+        if args.public_check == "strict":
+            print("[FATAL] Exiting due to --public-check strict.")
+            print("---- cloudflared output (last lines) ----")
+            for line in list(cf_keep_last)[-160:]:
+                print(line)
+            try:
+                cf_proc.terminate()
+            except Exception:
+                pass
+            try:
+                server_proc.terminate()
+            except Exception:
+                pass
+            sys.exit(6)
 
     # 3) read meta to know bundle count
     bundle_count = None
     try:
-        meta_txt = http_get(local_base + "/meta", timeout=5.0)
+        meta_txt = http_get(local_base + "/meta", timeout=5.0, proxy="")
         meta = json.loads(meta_txt)
         bundle_count = int(meta.get("bundle_count", 0))
     except Exception:
         pass
 
-    # Print shareable URLs
     print("\n============================================================")
     print("[READY] Share these URLs with your LLM:")
     print("")
@@ -414,7 +487,6 @@ def main():
     print(f"  {public_url}/file?path=README.md")
     print("============================================================")
 
-    # Prompt templates (Full + Precise)
     en_full, zh_full = format_prompt_full(public_url, bundle_count)
     en_precise, zh_precise = format_prompt_precise(public_url)
 
@@ -438,7 +510,6 @@ def main():
     print(zh_precise)
     print("------------------------------------------------------------\n")
 
-    # Auto open browser
     if args.open:
         target = f"{public_url}/all"
         print(f"[OPEN] opening browser: {target}")
@@ -449,18 +520,15 @@ def main():
 
     print("Stop: press Ctrl+C in this terminal.\n")
 
-    # keep running
     try:
         while True:
             time.sleep(1)
-
             if server_proc.poll() is not None:
                 print("[FATAL] server exited unexpectedly")
                 break
             if cf_proc.poll() is not None:
                 print("[FATAL] cloudflared exited unexpectedly")
                 break
-
     except KeyboardInterrupt:
         pass
     finally:
