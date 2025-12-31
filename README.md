@@ -153,6 +153,18 @@ Important: this is **risk reduction**, not a guarantee. Always assume public URL
 ### Cloudflare error 1033 on public URL
 Usually means `cloudflared` is not healthy or has exited. Keep the launcher terminal open and check cloudflared logs.
 
+### Corporate Wi‑Fi: URL works on mobile data but not on your laptop
+This usually means your corporate network blocks or interferes with `*.trycloudflare.com` (DNS poisoning, IP blocking, TLS inspection, etc.).
+
+What to do:
+- If you use Clash/other proxy tools, force `trycloudflare.com` to go through your working proxy group (not DIRECT).
+- Consider enabling Clash DNS / TUN if DNS is polluted.
+- Keep `--public-check warn`: local failure to open the URL does **not** necessarily mean the public URL is unreachable for your LLM.
+
+Quick verification:
+- Test on mobile 4G/5G: `https://<your>.trycloudflare.com/health`
+- Or test from a different network.
+
 ### Works locally but public /health times out
 Try:
 - `--proxy` if your network requires it

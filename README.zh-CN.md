@@ -134,6 +134,18 @@ python llm_server.py --root "/path/to/your/repo" --warmup
 ### 公网链接出现 Cloudflare 1033
 通常是 cloudflared 不健康或已退出。保持启动脚本所在终端运行，并观察 cloudflared 日志。
 
+### 公司 Wi‑Fi 下打不开，但手机 4G/5G 可以打开
+这通常是公司网络对 `*.trycloudflare.com` 做了限制或干扰（DNS 污染、Cloudflare 边缘 IP 封锁、TLS/代理审计等）。
+
+建议：
+- 如果使用 Clash 等代理工具，请把 `trycloudflare.com` 强制走可用代理策略（不要走 DIRECT）。
+- 如遇 DNS 污染，可开启 Clash DNS / TUN。
+- 推荐使用 `--public-check warn`：本机公司网打不开 **不代表** 外网/LLM 无法访问。
+
+快速验证：
+- 手机 4G/5G 打开：`https://<your>.trycloudflare.com/health`
+- 或在非公司网络环境测试。
+
 ### 本地 OK，但公网 /health 超时
 可尝试：
 - 在受限网络里使用 `--proxy`
